@@ -1,0 +1,74 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # API Service logs
+  - job_name: api-service
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: name
+            values: ['.*api.*']
+    
+    relabel_configs:
+      # Удаляем все служебные метки Docker
+      - action: labeldrop
+        regex: '__.*'
+      - action: labeldrop
+        regex: 'com_docker_compose.*'
+    
+    pipeline_stages:
+      # Парсим JSON для извлечения timestamp и service
+      - json:
+          expressions:
+            timestamp: timestamp
+            service: service
+            source: source
+          drop_malformed: false  # Не удаляем не-JSON логи
+      
+      # ВАЖНО: Удаляем все метки, которые могли попасть из JSON или Docker
+      # Это предотвращает создание лишних streams в Loki
+      - labeldrop:
+          - service_name
+          - level
+          - component
+          - environment
+          - event
+          - request_id
+          - user_id
+          - timestamp
+          - message
+      
+      # Извлекаем timestamp
+      - timestamp:
+          source: timestamp
+          format: RFC3339
+          fallback_formats:
+            - UnixTimestamp
+            - UnixTimestampMs
+      
+      # Нормализуем service (если не указан, используем "api")
+      - template:
+          source: service
+          template: '{{ if .service }}{{ .service }}{{ else }}api{{ end }}'
+      - template:
+          source: source
+          template: '{{ if .source }}{{ .source }}{{ else }}app{{ end }}'
+      
+      # Устанавливаем метку service (единственная метка для фильтрации)
+      - labels:
+          service: service
+          source: source
+      
+      # Выводим полный JSON лог как строку (все поля остаются в теле для поиска)
+      - output:
+          source: __line__
+

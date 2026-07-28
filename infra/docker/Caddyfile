@@ -1,0 +1,38 @@
+# Meleo Production Reverse Proxy
+# Auto-TLS via Let's Encrypt for all domains
+
+# API — mobile app and direct API consumers
+api.{$DOMAIN} {
+	reverse_proxy api:8001
+
+	encode gzip
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+}
+
+# Admin panel — protected by Supabase Auth + admin role
+admin.{$DOMAIN} {
+	reverse_proxy admin:80
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+}
+
+# Grafana — monitoring dashboards (protected by Grafana built-in auth)
+grafana.{$DOMAIN} {
+	reverse_proxy grafana:3000
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+	}
+}

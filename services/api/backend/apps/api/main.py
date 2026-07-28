@@ -1,0 +1,3 @@
+from backend.apps.api.factory import create_app
+
+app = create_app()

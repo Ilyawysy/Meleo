@@ -1,0 +1,190 @@
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      DB_POOL_SIZE: ${DB_POOL_SIZE}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW}
+
+      PG_SSLROOTCERT: /tmp/prod-ca-2021.crt
+      DB_SSL_ALLOW_SELF_SIGNED: "0"
+      DB_SSL_DISABLE: "0"
+            
+      # Supabase
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+
+      # Application
+      LOG_LEVEL: ${LOG_LEVEL}
+      ENV: ${ENV}
+      SERVICE_NAME: api
+      REQUEST_TIMEOUT_S: ${REQUEST_TIMEOUT_S}
+      UVICORN_ACCESS_LOG: "false"
+      DB_LOG_QUERIES: ${DB_LOG_QUERIES}
+
+      # Redis
+      REDIS_COORDINATION_HOST: redis-coordination
+      REDIS_COORDINATION_PORT: 6379
+      REDIS_CACHE_HOST: redis-cache
+      REDIS_CACHE_PORT: 6379
+
+      # Load testing (set to "true" to bypass rate limits in dev)
+      LOADTEST_MODE: ${LOADTEST_MODE:-false}
+
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      BASE_URL: ${AGENT_BASE_URL}
+      AGENT_MODEL: ${AGENT_MODEL}
+      AGENT_TOOL_TIMEOUT_S: ${AGENT_TOOL_TIMEOUT_S:-60}
+
+    depends_on:
+      redis-coordination:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    volumes:
+      - ../../services/api/backend:/app/backend
+      - ../../services/api/alembic.ini:/app/alembic.ini:ro
+      - ../certs/prod-ca-2021.crt:/tmp/prod-ca-2021.crt:ro
+    command: bash -lc "alembic -c alembic.ini upgrade head && uvicorn backend.apps.api.main:app --host 0.0.0.0 --port 8001 --reload --no-access-log"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # Coordination Redis: noeviction (rate limit, semaphore — never evicts keys)
+  redis-coordination:
+    image: redis:7-alpine
+    container_name: meleo-redis-coordination
+    volumes:
+      - redis-coordination-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --save 60 100
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # Cache Redis: allkeys-lru (ETag, cursor, gamification — safe to evict)
+  redis-cache:
+    image: redis:7-alpine
+    container_name: meleo-redis-cache
+    volumes:
+      - redis-cache-data:/data
+    command: >
+      redis-server
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-data:/tmp
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - node_exporter
+    restart: unless-stopped
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - loki
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-coordination-data:
+  redis-cache-data:
+  loki-data:
+  promtail-data:
+  grafana-data:
+  prometheus-data:
